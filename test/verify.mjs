@@ -233,8 +233,7 @@ if (snapshot) {
   check('fixture: counts summarise both runs', runs.counts.running === 1 && runs.counts.completed === 1, JSON.stringify(runs.counts))
   check('fixture: the parent session rollup lists children', runs.tasks.length === 0 && runs.sessions.some((entry) => entry.sessionId === 'sess_parent-1'), `${runs.sessions.length} sessions`)
   check('fixture: a missing task index degrades quietly', runs.indexAvailable === false && Array.isArray(runs.notes), String(runs.indexAvailable))
-  check('fixture: no prompt text leaks into the snapshot', !JSON.stringify(runs).includes('PROMPT-MUST-NOT-APPEAR'))
-  check('fixture: the report path is not exposed as content', !JSON.stringify(runs).includes('PROMPT-MUST-NOT-APPEAR') && !("prompt" in (running ?? {})))
+  check('fixture: no prompt text leaks into the snapshot', !JSON.stringify(runs).includes('PROMPT-MUST-NOT-APPEAR') && !('prompt' in (running ?? {})))
 
   rmSync(fixture, { recursive: true, force: true })
 }
