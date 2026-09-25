@@ -8,8 +8,8 @@ It ships three things:
 | Piece | What it does |
 |---|---|
 | `bridge/zcode-bridge.mjs` | Local OpenAI-compatible endpoint (`POST /v1/chat/completions`) that types a prompt into the running ZCode window, waits for the turn to finish, and returns the answer |
-| plugin `dsh-zcode-connect` | Host half with a loopback status route + a self-contained HTML panel (account, plan, live quota, loaded capabilities, what this connector installed) |
-| `mcp/server.mjs` | MCP stdio server exposing status, ask, and provisioning tools to any MCP client (DSH consumes it through `@deepseek-ai/dsh-mcp-client`) |
+| plugin `dsh-zcode-connect` | Host half with a loopback status route + a self-contained HTML panel (account, plan, live quota, loaded capabilities, what this connector installed, and what the client is running in the background right now) |
+| `mcp/server.mjs` | MCP stdio server exposing status, background runs, ask, and provisioning tools to any MCP client (DSH consumes it through `@deepseek-ai/dsh-mcp-client`) |
 
 ## Why drive the GUI instead of using an API key
 
@@ -68,6 +68,41 @@ Apart from that, nothing is unusual: the same widgets, the same events, the same
 
 There is no hidden channel and no injected business logic: the automation layer only clicks, types,
 and reads what the client already displays or persists.
+
+## Watching what the client runs in the background
+
+When ZCode works, it works **inside its own process**: the primary agent spawns subagents, runs tool
+calls, and keeps going on its own. Nothing about that reaches the harness that asked for it — DSH's
+own sidebar lists DSH's subagents and jobs, and it cannot see the ones running in another
+application. The connector therefore reads the client's own state files and renders them into its
+panel (and over MCP), so the run is visible while it happens:
+
+| Shown | Meaning |
+|---|---|
+| running subagents | role, the task it was given, the tool it is executing **right now** (with its target path), elapsed time, turns, tool calls, tokens |
+| finished subagents | outcome (`done` / `partial` / `blocked`), duration, tokens, tool count, the `CHANGED:` / `FAILED:` item list from its own report |
+| recent tasks | the client's task list with per-task subagent count, total tokens, and last activity |
+| generating indicator | whether inference is open right now, and for how long |
+| scheduled work | Automations, their runs, and idle-time (off-peak) tasks |
+
+It is passive: three reads of files the client already writes, no injection, no polling of the GUI,
+no extra quota.
+
+| Source | What it yields |
+|---|---|
+| `~/.zcode/cli/agents/sess_*/agent_*/metadata.json` | one directory per subagent run: role, task, status, tokens, tool count, duration |
+| `~/.zcode/cli/agents/sess_*/agent_*/output.txt` | the worker's own report, parsed into outcome + counts + item list |
+| `~/.zcode/cli/rollout/model-io-*.jsonl` | one record per model round trip, appended as the run proceeds (live turn count) |
+| `~/.zcode/cli/log/zcode-<date>.jsonl` | the client's turn lifecycle: open inference requests, every tool call, per-session phases |
+| `~/.zcode/v2/tasks-index.sqlite` | task titles, per-task status, Automations and off-peak runs |
+
+The same view is available to an agent as the `zcode_runs` MCP tool, which is the practical way to
+watch a long handoff: a single call reports what is running, what it is doing, and what finished.
+The panel refreshes every 15 s while it is open.
+
+This is also what makes long runs safe to hand over. A thinking-heavy turn can outlast a caller's own
+wait budget — the call returns a timeout, the client keeps working — and the run stays observable
+instead of being lost with the call.
 
 ## Extensibility: turn ZCode into a grunt-work executor
 
@@ -154,6 +189,7 @@ Tools then appear as `mcp__zcode__<name>`:
 | Tool | Purpose | Spends quota |
 |---|---|---|
 | `zcode_status` | account, plan, live remaining quota, loaded channels | no |
+| `zcode_runs` | what the client is running in the background right now, plus what it just finished | no |
 | `zcode_ask` | one prompt → `GLM-5.3-Flash` → the reply | **yes** |
 | `zcode_install_skill` | install a skill into the client (`~/.zcode/skills/<name>/SKILL.md`) | no |
 | `zcode_install_agent` | install a user-level subagent role (`~/.zcode/agents/<name>.md`) | no |
@@ -189,7 +225,8 @@ paths).
   switches it if it reads the metered `bigmodel-api/…` channel instead.
 - **UTF-8 required** by callers; the OpenAI SDK path is fine, PowerShell 5.1's `-Body <string>` is not.
 - **Latency**: 14–20 s for a short reply, ~100 s for a fan-out batch. `toolCallTimeoutMs` should be
-  generous.
+  generous. A turn spent thinking at the highest level can exceed any fixed budget while the client
+  keeps working — `zcode_runs` (or the panel) shows that run continuing.
 - **The client is an agent, not a bare model**: with a project open, a prompt may edit files. Keep
   its workspace empty while using this as a model channel.
 - **Quota accounting is not exposed per call** — `usage` is reported as zero. Read the panel, or the
@@ -220,11 +257,12 @@ capacity is available (that one is free — it does not spend the grant).
 bridge/zcode-bridge.mjs      OpenAI-compatible endpoint driving the GUI over CDP
 lib/index.js                 plugin host half: status route + panel route (loopback only)
 lib/status.js                CDP probe, credential decrypt, plan/quota, capabilities
+lib/runs.js                  background runs: subagents, client log activity, task index
 lib/panel.js                 self-contained HTML panel (no build step, no React)
 lib/provision.js             install/remove skills, subagent roles, MCP servers
 mcp/server.mjs               MCP stdio server (zero dependencies, hand-rolled JSON-RPC)
 skills/                      the handoff / grunt-batch / fan-out skill texts
-test/verify.mjs              self-check: exports, routing, loopback guard, no token leakage
+test/verify.mjs              self-check: exports, routing, loopback guard, run parsing, no token leakage
 ```
 
 ## Privacy
@@ -235,6 +273,10 @@ a log line, or the panel — the account section reports only an identity and a 
 self-check asserts this (`status JSON does not contain the account token`,
 `panel HTML does not contain the account token`).
 
+The background-run view follows the same rule: it reports a run's role, status, timings, counts,
+changed paths and its own report — not the prompt it was given and not its system prompt. The
+self-check asserts that too (`no prompt text leaks into the snapshot`).
+
 ## Self-check
 
 ```bash
@@ -242,8 +284,10 @@ node test/verify.mjs
 ```
 
 It asserts the export surface, both route registrations, the loopback guard, the live status
-snapshot, and — most importantly — that neither the status JSON nor the panel HTML can leak the
-account token.
+snapshot, the background-run view against a synthetic client home (a run without a completion stamp
+must read as running, an open inference request must read as generating, a finished run must carry
+its own report), and — most importantly — that neither the status JSON nor the panel HTML can leak
+the account token.
 
 The plugin imports `@deepseek-ai/schemastery`, so the check uses the same dependency bridge the
 install section describes.

@@ -7,6 +7,8 @@
  * `mcp__zcode__<name>`.
  *
  *   zcode_status  plan + live balance + client capabilities (read-only, free)
+ *   zcode_runs    what the client is running in the background right now: its own
+ *                 subagents, recent tasks, scheduled/off-peak runs (read-only, free)
  *   zcode_ask     send one prompt through the ZCode GUI and return the reply
  *                 (this is what spends the grant; the bridge serialises calls)
  *
@@ -27,6 +29,7 @@
  *       failOnStartupError: false
  */
 import { collectStatus } from '../lib/status.js'
+import { describeRuns } from '../lib/runs.js'
 import { installAgent, installMcpServer, installSkill, listInstalled, removeAgent, removeMcpServer, removeSkill } from '../lib/provision.js'
 
 const PROTOCOL_VERSION = '2025-06-18'
@@ -110,6 +113,18 @@ const TOOLS = [
     },
   },
   {
+    name: 'zcode_runs',
+    description:
+      'List what the ZCode client is running in the background — its own subagents, recent tasks, and scheduled/off-peak runs — plus whether it is generating right now. Read-only and free: it reads the client state files the DSH sidebar cannot see. Use it to watch a handoff instead of polling the GUI.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Maximum subagent runs to list (default 15).' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'zcode_capabilities',
     description: 'List what this connector has installed on the ZCode client: skills and user-scope MCP servers.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
@@ -128,6 +143,77 @@ const TOOLS = [
     },
   },
 ]
+
+/**
+ * Compose the background-run digest: what the client is doing now, and what it just did.
+ * One line per run keeps this readable for a model instead of dumping the whole snapshot.
+ */
+function summarizeRuns(runs) {
+  const live = runs.live ?? {}
+  const current = live.current ?? null
+  const lines = []
+
+  lines.push(
+    live.generating
+      ? `client: generating right now (${live.openRequests} open request(s)${current?.waitingMs ? `, waiting ${Math.round(current.waitingMs / 1000)}s` : ''})`
+      : live.busy
+        ? 'client: active a moment ago'
+        : 'client: idle',
+  )
+  if (current) {
+    lines.push(
+      `current: ${current.agentType ? `subagent ${current.agentType}` : `session ${current.sessionId}`}` +
+        `${current.phase ? ` · phase ${current.phase}` : ''}${current.tool ? ` · last tool ${current.tool}` : ''}` +
+        `${current.quietForMs !== null ? ` · quiet ${Math.round(current.quietForMs / 1000)}s` : ''}`,
+    )
+  }
+
+  const agents = runs.agents ?? []
+  const running = agents.filter((agent) => agent.running)
+  const finished = agents.filter((agent) => !agent.running && !agent.stale)
+
+  lines.push(`subagents: ${running.length} running, ${finished.length} finished recorded (${runs.counts?.tokens ?? 0} tokens, ${runs.counts?.toolUses ?? 0} tool calls total)`)
+  for (const agent of running) {
+    const waiting = agent.generating ? 'generating' : 'working'
+    lines.push(
+      `  RUNNING ${agent.role ?? 'subagent'} — ${agent.description ?? '(no description)'} · ${waiting}` +
+        `${agent.activity?.lastTool ? ` · tool ${agent.activity.lastTool}` : ''}` +
+        `${agent.activity?.turns ? ` · turn ${agent.activity.turns}` : ''}` +
+        ` · elapsed ${Math.round((agent.durationMs ?? 0) / 1000)}s · ${agent.tokens ?? 0} tokens`,
+    )
+  }
+  for (const agent of finished.slice(0, 12)) {
+    const counts = agent.counts ? Object.entries(agent.counts).filter(([, value]) => value > 0).map(([key, value]) => `${key}=${value}`).join(' ') : ''
+    lines.push(
+      `  DONE    ${agent.role ?? 'subagent'} — ${agent.description ?? '(no description)'} · ${agent.outcome ?? agent.status}` +
+        ` · ${Math.round((agent.durationMs ?? 0) / 1000)}s · ${agent.tokens ?? 0} tokens · ${agent.toolUses ?? 0} tools` +
+        `${counts ? ` · ${counts}` : ''}`,
+    )
+    for (const item of (agent.items ?? []).slice(0, 4)) lines.push(`            ${item.kind}: ${item.path}`)
+  }
+  for (const agent of agents.filter((entry) => entry.stale)) {
+    lines.push(`  STALLED ${agent.role ?? 'subagent'} — ${agent.description ?? '(no description)'} · no completion stamp, quiet ${Math.round((agent.quietForMs ?? 0) / 1000)}s`)
+  }
+
+  const tasks = (runs.tasks ?? []).filter((task) => task.open || task.live || task.agents > 0).slice(0, 8)
+  if (tasks.length > 0) {
+    lines.push('tasks:')
+    for (const task of tasks) {
+      lines.push(`  ${task.open || task.live ? 'RUNNING' : 'done   '} ${(task.title ?? task.taskId).slice(0, 80)} · ${task.agents} subagent(s)`)
+    }
+  }
+
+  const scheduled = runs.automations?.scheduled ?? []
+  const offPeak = runs.automations?.offPeak ?? []
+  if (scheduled.length > 0 || offPeak.length > 0) {
+    lines.push(`scheduled runs: ${scheduled.length} automation(s), ${offPeak.length} off-peak task(s)`)
+    for (const item of scheduled.slice(0, 5)) lines.push(`  ${item.enabled ? 'on ' : 'off'} ${item.title ?? item.id} · ${item.cron ?? '?'} · next ${item.nextRunAt ?? '?'}`)
+    for (const item of offPeak.slice(0, 5)) lines.push(`  off-peak ${item.title ?? item.id} · ${item.status ?? '?'}`)
+  }
+
+  if (runs.notes?.length) lines.push(`notes: ${runs.notes.join(' · ')}`)
+  return lines.join('\n')
+}
 
 /** Compose a compact, human-readable summary for the model. */
 function summarize(status) {
@@ -155,6 +241,12 @@ async function callTool(name, args) {
     return { text: summarize(status), structured: status }
   }
 
+  if (name === 'zcode_runs') {
+    const limit = Number.isFinite(args?.limit) ? Math.max(1, Math.min(100, Number(args.limit))) : 15
+    const runs = await describeRuns(undefined, { limit })
+    return { text: summarizeRuns(runs), structured: runs }
+  }
+
   if (name === 'zcode_ask') {
     const prompt = typeof args?.prompt === 'string' ? args.prompt.trim() : ''
     if (!prompt) throw new Error('zcode_ask requires a non-empty "prompt" string')
@@ -169,7 +261,7 @@ async function callTool(name, args) {
     } catch (error) {
       throw new Error(
         `cannot reach the ZCode bridge at ${BRIDGE_URL} (${error.message}). ` +
-          `Start it with: node bridge/zcode-bridge.mjs — and make sure ZCode runs with --remote-debugging-port=${DEBUG_PORT}.`,
+          `Start it with: node D:/GitHub/bridge/zcode-bridge.mjs — and make sure ZCode runs with --remote-debugging-port=${DEBUG_PORT}.`,
       )
     }
     const text = await response.text()

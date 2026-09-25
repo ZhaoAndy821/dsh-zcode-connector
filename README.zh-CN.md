@@ -72,6 +72,33 @@ GLM-5.3-Flash token）在客户端目录里声明为**账号绑定**：
 - **客户端状态**：ZCode 是否以 `--remote-debugging-port=9333` 在跑、版本、CDP 浏览器串；以及 GUI 桥 `9444` 是否在跑、队列深度
 - **装载能力**：读客户端自己的 `v2/config.json`，列出每个通道（协议 / baseURL / 是否启用 / key 是否存在 / 模型数），以及内置模板数与已启用插件
 - **套餐权益**：`billing/current` 的 entitlements（项目名 / capabilities / 额度 / 周期）
+- **后台运行状况**：客户端自己的 subagent 及其任务（见下一节）
+
+## 后台与 subagent 的运行状况
+
+ZCode 干活是在**它自己的进程里**干的：主 agent 派发 subagent、跑工具调用、一轮轮往下走。这些都不会流到发起方那边 —— DSH 侧边栏只列 DSH 自己的 subagent 和 job，看不见另一个应用里正在跑的东西。所以本插件直接读客户端自己的状态文件，把运行状况画进面板，也通过 MCP 暴露给 Agent：
+
+| 显示 | 含义 |
+|---|---|
+| 正在运行的 subagent | 角色、分到的任务、**此刻正在执行的工具**（带目标路径）、已运行时长、轮次、工具调用数、tokens |
+| 已完成的 subagent | 结论（`done` / `partial` / `blocked`）、用时、tokens、工具数，以及它自己报告里的 `CHANGED:` / `FAILED:` 清单 |
+| 最近任务 | 客户端的任务列表，含每任务派了几个 subagent、总 tokens、最近活动时间 |
+| 生成指示 | 此刻是否正在推理、已经等了多久 |
+| 定时与空闲任务 | Automations 及其运行记录、空闲时段（off-peak）任务 |
+
+整个过程是**被动读取**：读三个客户端本来就在写的文件，不注入、不轮询 GUI、不额外消耗额度。
+
+| 来源 | 提供什么 |
+|---|---|
+| `~/.zcode/cli/agents/sess_*/agent_*/metadata.json` | 每个 subagent 运行一个目录：角色、任务、状态、tokens、工具数、用时 |
+| `~/.zcode/cli/agents/sess_*/agent_*/output.txt` | worker 自己的报告，解析成结论 + 计数 + 改动清单 |
+| `~/.zcode/cli/rollout/model-io-*.jsonl` | 每完成一次模型往返追加一条（运行中的实时轮次） |
+| `~/.zcode/cli/log/zcode-<日期>.jsonl` | 客户端的轮次生命周期：打开的推理请求、每次工具调用、每个会话的阶段 |
+| `~/.zcode/v2/tasks-index.sqlite` | 任务标题、每任务状态、Automations 与空闲时段任务 |
+
+对 Agent 来说，同一个视图就是 `zcode_runs` 这个 MCP 工具：一次调用就能看到"正在跑什么、此刻在做什么、刚跑完什么"，是盯着长任务交接的实用方式。面板打开时每 15 秒刷新一次。
+
+这也让长任务敢交出去：一个高强度思考的轮次可能超过调用方自己的等待上限 —— 调用返回超时，客户端还在继续干 —— 而这次运行仍然可见，不会随着调用一起消失。
 
 ## 两个路由
 
@@ -102,6 +129,7 @@ cipher = aes-256-gcm
 3. 面板要读套餐接口，需要账号 token 未过期；过期时 `grant.errors` 会原样显示。
 4. 状态有 15 秒缓存（`cacheMs`），避免频繁打套餐接口。
 5. 余额是**周末活动额度**，`expires_at` 到了就归零；它按天重置，面板显示的永远是当前可用。
+6. 高思考强度的一轮可能比调用方自己的等待上限还长：调用方会拿到超时，客户端仍在继续干。这时用 `zcode_runs` 或面板看那次运行 —— 它不会因为调用超时而消失。
 
 ## 配置
 
@@ -132,6 +160,7 @@ cipher = aes-256-gcm
 | 工具 | 作用 | 是否花额度 |
 |---|---|---|
 | `zcode_status` | 套餐 / 实时余额 / 客户端已装载通道 | 否（只读） |
+| `zcode_runs` | 客户端后台此刻在跑什么、刚跑完什么（subagent / 任务 / 定时与空闲任务） | 否（只读） |
 | `zcode_ask` | 把一段 prompt 经 GUI 桥发给 GLM-5.3-Flash，返回回复 | **是**（每次一问） |
 | `zcode_install_skill` | 给 ZCode 的 Agent 装一个技能（`~/.zcode/skills/<名>/SKILL.md`） | 否 |
 | `zcode_install_mcp` | 给 ZCode 装一个 MCP server（用户级 `~/.zcode/cli/config.json → mcp.servers`） | 否 |
@@ -178,13 +207,15 @@ cipher = aes-256-gcm
 实测（12 个文件、两个子智能体并行）：主 Agent 自报"已确认 12 个文件，拆成 2 块，每块 6 个，并行启动两个批处理工作线程"，
 两个 worker 各自产出契约格式报告，全部 12 个文件改毕，耗时 1 分 50 秒。
 
+这两条并行的工作线程**在跑的当下就能在面板里看到**（角色、任务、正在执行的工具与目标、轮次、tokens），跑完各自带出 `outcome / counts / CHANGED` —— 见上面的"后台与 subagent 的运行状况"。
+
 ### 循环 / 定时（原生能力，不必自己造）
 
 ZCode 自带：**Automations → 定时任务**（可选每任务模型与思考强度）与 **Idle-time task**（无排期，空闲时排队跑，**免费**）。
 Agent 工具面里还有 `CronCreate` / `CronList` / `CronDelete` / `Monitor` / `ScheduleWakeup`，
 所以"让它自己跑 24 小时"可以直接用 prompt 让它建 cron，不需要外部循环。
 
-## 自检
+## 把 MCP 装到 DSH
 
 ```yaml
 - id: mcp-zcode
@@ -206,6 +237,8 @@ Agent 工具面里还有 `CronCreate` / `CronList` / `CronDelete` / `Monitor` / 
 
 ```powershell
 node test/verify.mjs      # 导出面 / 路由接线 / 回环校验 / 无 token 泄漏 / 真实快照
+                          # + 后台运行记录解析（合成客户端目录：未完成的算运行中、
+                          #   有打开的推理请求算生成中、已完成的必须带出自己的报告）
 ```
 
 ## 面板形态
