@@ -13,9 +13,9 @@
  *   4. 每次请求开一个**新对话**（点"新建任务"），避免上下文叠加。
  *   5. ZCode 必须开着，但**不需要在前台**：最小化/被遮挡/未聚焦都行（事件投递给渲染进程，
  *      与窗口层级无关）；关掉它才会断。用户在同一对话里手动打字会干扰本次请求。
- *   6. **窗口位置和大小随便**：本桥从不读窗口坐标，attach 时把渲染进程视口钉在 VIEWPORT
- *      （默认 1280×900），之后每次动作都重算元素中心 + 命中测试。唯一的几何要求是输入框和
- *      发送键留在视口内；窄到把它们裁掉时报定位失败，不会瞎点。
+ *   6. **窗口位置和大小随便**：本桥从不读窗口坐标，也从不移动或缩放窗口。调用期间只把**页面自己的
+ *      布局视口冻结在窗口当时的尺寸与 dpr**（仅当窗口报不出可用尺寸时才退回 VIEWPORT 默认值），
+ *      调用一结束立即释放 —— 目的是让"量坐标 → 点击"之间不会因为窗口被拖动而漂移，画面不变。
  *   7. ZCode 是 agent 不是裸模型：若它在 UI 里打开了项目目录，它可能真的去动文件。
  *   8. 上游报错会原样抛出（如 `[1113] 余额不足…`），不返回空串。
  *
@@ -30,7 +30,10 @@ import { join } from 'node:path'
 
 const HTTP_PORT = Number(process.env.ZCODE_BRIDGE_PORT ?? 9444)
 const CDP_PORT = Number(process.env.ZCODE_CDP_PORT ?? 9333)
-const VIEWPORT = { width: Number(process.env.ZCODE_VIEWPORT_W ?? 1280), height: Number(process.env.ZCODE_VIEWPORT_H ?? 900) }
+/** Only a fallback for when the window reports no usable size; the window's own size wins. */
+const VIEWPORT_FALLBACK = { width: Number(process.env.ZCODE_VIEWPORT_W ?? 1280), height: Number(process.env.ZCODE_VIEWPORT_H ?? 900) }
+/** Below this the window is not reporting a real layout at all (1400x1041 works fine). */
+const MIN_VIEWPORT = { width: 640, height: 480 }
 const REPLY_TIMEOUT_MS = Number(process.env.ZCODE_REPLY_TIMEOUT_MS ?? 240_000)
 const STABLE_SAMPLES = 3
 const SAMPLE_INTERVAL_MS = 1200
@@ -72,6 +75,48 @@ async function evaluate(cdp, expression) {
   const result = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, userGesture: true })
   if (result.exceptionDetails) throw new Error(`页面内报错: ${JSON.stringify(result.exceptionDetails).slice(0, 300)}`)
   return result.result.value
+}
+
+/**
+ * Freeze the page's layout viewport for the duration of one request, at the size the window
+ * already has.
+ *
+ * Why freeze at all: a target's centre is read, then the element is clicked. If the window is
+ * resized in between, the target moves and the click lands somewhere else. Freezing removes that
+ * race for the whole turn (which can run for minutes).
+ *
+ * Why the window's OWN size rather than a fixed 1280x900: the app lays out against the viewport it
+ * is told it has, anchored to the bottom — measured, the composer sits exactly 73 px above the
+ * bottom edge at both 1244x802 and 1280x900. Announcing a viewport taller than the window therefore
+ * pushes the composer below the visible area for as long as the override lasts (measured: composer
+ * top at y=787 against an 802 px tall window). Pinning the current size and the current device
+ * pixel ratio freezes the geometry without changing a single pixel of what the user sees, and it is
+ * released as soon as the request ends.
+ */
+async function freezeViewport(cdp) {
+  let current = null
+  try {
+    const raw = await evaluate(cdp, 'JSON.stringify({ w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio })')
+    if (raw) current = JSON.parse(raw)
+  } catch {
+    current = null
+  }
+  const usable = current !== null
+    && Number.isFinite(current.w) && Number.isFinite(current.h)
+    && current.w >= MIN_VIEWPORT.width && current.h >= MIN_VIEWPORT.height
+  const size = usable ? { width: Math.round(current.w), height: Math.round(current.h) } : VIEWPORT_FALLBACK
+  const deviceScaleFactor = usable && Number.isFinite(current.dpr) && current.dpr > 0 ? current.dpr : 1
+  await cdp.send('Emulation.setDeviceMetricsOverride', { ...size, deviceScaleFactor, mobile: false })
+  return { ...size, deviceScaleFactor, source: usable ? 'window' : 'fallback' }
+}
+
+/** Hand the page back its own layout. Safe to call on a session that is already gone. */
+async function releaseViewport(cdp) {
+  try {
+    await cdp.send('Emulation.clearDeviceMetricsOverride')
+  } catch {
+    /* the session is closing anyway */
+  }
 }
 
 async function clickPoint(cdp, x, y) {
@@ -360,7 +405,8 @@ const server = createServer(async (request, response) => {
     const reply = await serialize(async () => {
       const cdp = await attach()
       try {
-        await cdp.send('Emulation.setDeviceMetricsOverride', { ...VIEWPORT, deviceScaleFactor: 1, mobile: false })
+        const frozen = await freezeViewport(cdp)
+        console.log(`[bridge] viewport frozen at ${frozen.width}x${frozen.height} @${frozen.deviceScaleFactor}x (source: ${frozen.source})`)
         await newTask(cdp)
         const channel = await ensureStartPlan(cdp)
         const transcriptsBefore = transcriptSizes()
@@ -370,6 +416,7 @@ const server = createServer(async (request, response) => {
         if (/\[\d{4}\]|余额不足|captcha verify failed|登录|请充值/.test(text)) throw new Error(`上游报错: ${text.slice(0, 200)}`)
         return { text, channel }
       } finally {
+        await releaseViewport(cdp)
         cdp.close()
       }
     })
@@ -391,6 +438,6 @@ const server = createServer(async (request, response) => {
 })
 
 server.listen(HTTP_PORT, '127.0.0.1', () => {
-  console.log(`zcode-bridge on http://127.0.0.1:${HTTP_PORT}  (CDP ${CDP_PORT}, viewport ${VIEWPORT.width}x${VIEWPORT.height})`)
+  console.log(`zcode-bridge on http://127.0.0.1:${HTTP_PORT}  (CDP ${CDP_PORT}; the window's own viewport is frozen per request, fallback ${VIEWPORT_FALLBACK.width}x${VIEWPORT_FALLBACK.height})`)
   console.log('限制: ZCode 必须开着(带调试端口) · 串行 · 每请求新对话 · 频道必须是 Start Plan')
 })

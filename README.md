@@ -56,22 +56,29 @@ renderer over CDP, which is independent of window stacking and of OS focus, so Z
 minimised behind your other work — it just has to be running. (Measured: the app was launched
 minimised and every click and keystroke below still landed.)
 
-**Where the window sits, and how big it is, does not matter either.** The bridge never reads the
-window's position or its outer size; it works entirely inside the renderer's own coordinate space.
-On attach it pins that space (`Emulation.setDeviceMetricsOverride`, 1280×900), and on every action it
-re-reads the target's `getBoundingClientRect()` centre, re-checks with a hit test that the point
-really lands on the intended element, and waits 120 ms for the box to stop moving before clicking.
-Move the window, resize it, drag it half off-screen — the next action simply recomputes. Measured on
-a window that had just been dragged to a new position, same page read twice:
+**Window position and size are not part of the contract.** Two different things are easy to confuse
+here, so the connector keeps them apart:
 
-| Reading | Composer | Send button | Viewport |
-|---|---|---|---|
-| real window layout (bridge detached) | (345, 689) 802×40 | (1119, 741) | 1244×802 |
-| the bridge's pinned canvas (after attach) | (345, 787) 838×40 | (1155, 839) | 1280×900 |
+| | What it is | Does the bridge touch it? |
+|---|---|---|
+| the window | the OS window you open from the dock or taskbar — a display surface | **no**: never read, never moved, never resized |
+| the renderer page | the Chromium page inside that window (`file://…/renderer/index.html`) — the only CDP target the bridge attaches to | only its *layout viewport*, and only for the duration of one request |
 
-The one geometric requirement is that the composer and its send button are **inside the viewport**:
-a window narrow enough to clip them is reported as a locate failure, never clicked blind. At 1244 px
-wide the send button ends at x=1147; on the pinned 1280-wide canvas, at x=1183.
+There is exactly one page target and it is the renderer of the very window you use; no second, hidden
+window is opened. The status/panel half touches no window at all — it reads files.
+
+The page's viewport is frozen for the length of a request because a turn can run for minutes: a
+target's centre is measured and then clicked, and if the window were resized in between, the target
+would have moved. The freeze uses the size the window **already has**, plus its device pixel ratio, so
+nothing you see changes, and it is released the moment the request ends. Verified: with the fallback
+deliberately set to 1000×700 the bridge logs `viewport frozen at 1280x900 @1.5x (source: window)`, and
+an override placed before a call is gone after it — the page returns to its own 1280×900 at dpr 1.5.
+
+The app lays out against the viewport it is told it has, anchoring its composer 73 px above the bottom
+edge (measured at 1244×802, 1100×650 and 1280×900). Announcing a size *larger* than the window is
+therefore what pushes the composer off the bottom of the window — which is why the bridge announces the
+window's own size; `ZCODE_VIEWPORT_W` / `ZCODE_VIEWPORT_H` are only a fallback for a window reporting
+no usable size (below 640×480).
 
 Apart from that, nothing is unusual: the same widgets, the same events, the same request path.
 
@@ -236,10 +243,11 @@ paths).
 - **The client must be running** with the debug port. It does **not** need to be in the foreground:
   minimised, behind other windows, or unfocused all work, because events are delivered to the
   renderer rather than to the OS window.
-- **Window geometry is free — position and size are never read.** Every action recomputes the target's
-  centre in the renderer's own (pinned) coordinate space. The single geometric requirement is that the
-  composer and its send button stay inside the viewport; a window narrow enough to clip them is
-  reported as a locate failure, not clicked blind.
+- **Window geometry is free.** The OS window is never read, moved or resized; the bridge attaches to the
+  renderer page inside it. For the duration of one request the page's layout viewport is frozen at the
+  window's *current* size (and device pixel ratio) so a target cannot drift between being measured and
+  being clicked, and it is released when the request ends — a per-request freeze, not a resize of your
+  window.
 - **Serial**: one conversation, one input box. The bridge queues; it does not parallelise.
 - **One new task per call** — the client keeps no history between calls, so send full context.
 - **Channel must be `Start Plan`.** The bridge checks the composer's model label every call and
