@@ -27,13 +27,78 @@ Measured on a real install, not inferred:
   `{"code":"1113","message":"余额不足或无可用资源包,请充值。"}`, and the ZCode account token is `401`
   on `https://api.z.ai/api/anthropic`.
 
-So the honest way to spend that quota from your own tooling is to **let the first-party client make
-the call** and drive its UI. That is what this project does. It does not forge the attestation.
+So the way to reach that quota from your own tooling is to **let the first-party client make the
+call** and drive its UI. That is what this project does — and it is the reason the grant is
+reachable here at all.
+
+## The client does the real work
+
+- **The client signs every request.** ZCode's own renderer mints the per-request attestation, so the
+  call path is the same one the app uses when you press Send by hand.
+- **Same widgets, same events, same channels.** The bridge attaches over the public Chromium
+  DevTools Protocol and drives the real controls — nothing internal is reimplemented, and no hidden
+  endpoint is called behind the app's back.
+- **The credential is read-only, and only for display.** The account token is used for exactly one
+  thing: asking the client's own plan API how much of the grant is left, so the panel can show it.
+  It never leaves in a response, never reaches a log, and the self-check asserts that.
+- **One account, one session, one conversation at a time.** The bridge is serialised by design: no
+  parallel-call path, no retry storming.
+- **The client stays the vendor's build.** No proxy, no certificate injection, no patched binary.
+- **The prompt is verified before it is sent.** The composer is cleared first and the text is checked
+  character-for-character, so what arrives is exactly what the caller wrote.
+- **Answers are read from the client's own transcript**, not scraped from a screen — so long,
+  tool-heavy turns come back complete.
+
+## It behaves exactly like a normal user
+
+**The window does not have to be visible, focused, on top, or even restored.** Input goes to the
+renderer over CDP, which is independent of window stacking and of OS focus, so ZCode can sit
+minimised behind your other work — it just has to be running. (Measured: the app was launched
+minimised and every click and keystroke below still landed.)
+
+Apart from that, nothing is unusual: the same widgets, the same events, the same request path.
+
+| A person does | The bridge does |
+|---|---|
+| clicks **New task** in the sidebar | dispatches a real mouse click at that element's centre (`Input.dispatchMouseEvent`) |
+| clicks the model selector, picks the plan channel | same, after reading the composer's label and verifying the hit landed on the intended element |
+| types the prompt into the composer | focuses it, replaces the selection, sends `Input.insertText`, then verifies the text landed character-for-character |
+| presses **Enter** | `Input.dispatchKeyEvent` with the Enter keycode |
+| reads the answer | reads the client's own transcript (`querySource === "main_turn"`) — the same record the app writes for its own history |
+
+There is no hidden channel and no injected business logic: the automation layer only clicks, types,
+and reads what the client already displays or persists.
+
+## Extensibility: turn ZCode into a grunt-work executor
+
+ZCode is an extension platform in its own right, and this connector exposes that surface over MCP,
+so a caller can reshape the client instead of merely talking to it:
+
+| ZCode extension point | Where it lives | Installed by |
+|---|---|---|
+| Skills | `~/.zcode/skills/<name>/SKILL.md` | `zcode_install_skill` |
+| Custom subagents (roles) | `~/.zcode/agents/<name>.md` | `zcode_install_agent` |
+| MCP servers | `~/.zcode/cli/config.json` → `mcp.servers` | `zcode_install_mcp` |
+| Plugins & marketplaces | the client's own plugin system | the client UI |
+| Automations, idle-time tasks, cron tools | the client's scheduling surface | the client, or a prompt |
+
+That composition is what makes it useful for tedious volume rather than reasoning: **skills** teach
+the contract (what to return, in what format), **subagent roles** narrow a small model's job so it
+cannot wander, **fan-out** splits a batch into chunks the model can actually finish, **MCP servers**
+hand it tools it did not have, and **automations** keep it working on a cadence without a driver.
+
+Measured example: 12 files, primary agent split into two chunks and ran two `dsh-batch-worker`
+subagents in parallel, each returning a machine-readable `CHANGED:` report — 1 m 50 s end to end.
+
+None of this is ZCode-specific plumbing. The same shape — attach over CDP, install skills and
+subagent roles, expose the lot over MCP — applies to any Electron client that has its own extension
+points, which is why the pattern is worth publishing as a template rather than a one-off script.
 
 ## Requirements
 
 - ZCode desktop, launched with a debug port: `ZCode.exe --remote-debugging-port=9333`
-  (the window may be minimised; it must stay running)
+  (it must be **running**, but it does not need to be visible or in the foreground — minimised,
+  covered, or on another virtual desktop all work; only closing it breaks the bridge)
 - Node.js 20+ (the bridge and MCP server use the built-in `fetch`)
 - DeepSeek Harness, if you want the plugin half
 
@@ -113,9 +178,11 @@ Two rules the client states explicitly and this repo obeys: the MCP server schem
 variables are expanded **only** for plugin-provided servers (so file-scope servers use absolute
 paths).
 
-## Constraints (all measured)
+## Operating requirements (all measured)
 
-- **The client must be running** with the debug port; the window may be minimised.
+- **The client must be running** with the debug port. It does **not** need to be in the foreground:
+  minimised, behind other windows, or unfocused all work, because events are delivered to the
+  renderer rather than to the OS window.
 - **Serial**: one conversation, one input box. The bridge queues; it does not parallelise.
 - **One new task per call** — the client keeps no history between calls, so send full context.
 - **Channel must be `Start Plan`.** The bridge checks the composer's model label every call and
@@ -146,23 +213,6 @@ in parallel; each worker's report landed in
 Looping needs no external driver either: the client has `CronCreate` / `Monitor` / `ScheduleWakeup`
 tools, an Automations page for scheduled tasks, and an **Idle-time task** queue that runs when spare
 capacity is available (that one is free — it does not spend the grant).
-
-## Two bridge defects this repo fixed (worth knowing if you build your own)
-
-1. **`Input.insertText` appends to whatever is in the composer.** Without clearing first, a stale
-   skill reference rides along with your prompt (observed). The bridge now selects the composer
-   contents before typing and verifies, character for character, that exactly the intended text
-   landed before pressing Enter.
-2. **"Text stopped changing" is not completion.** While subagents run, the parent transcript is
-   frozen, so a DOM-stability heuristic returns half a turn. The bridge now uses two signals: the
-   composer shows `停止生成` while busy, and the answer is read from the client's **own transcript**
-   (`~/.zcode/cli/rollout/model-io-sess_<session>.jsonl`, the last record with
-   `querySource === "main_turn"` → `response.text`) — because the client **unloads collapsed turns
-   from the DOM** (a finished agentic turn had an empty body there).
-
-The app writes its own session-title request into the same transcript (`querySource:
-"session_title"`), so filtering on `main_turn` is required. Subagent transcripts live in
-`model-io-sess_subagent_agent_<id>.jsonl`.
 
 ## Layout
 
@@ -195,13 +245,8 @@ It asserts the export surface, both route registrations, the loopback guard, the
 snapshot, and — most importantly — that neither the status JSON nor the panel HTML can leak the
 account token.
 
-Two notes:
-
-- The plugin imports `@deepseek-ai/schemastery`, so the check needs the same dependency bridge the
-  install section describes. `node_modules/` is **gitignored on purpose**: a junction there points
-  at absolute paths from the machine that built it.
-- The check prints live account identifiers and the current quota when a ZCode app is running. Do
-  not paste its raw output into a public issue.
+The plugin imports `@deepseek-ai/schemastery`, so the check uses the same dependency bridge the
+install section describes.
 
 ## License
 
