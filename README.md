@@ -56,6 +56,23 @@ renderer over CDP, which is independent of window stacking and of OS focus, so Z
 minimised behind your other work — it just has to be running. (Measured: the app was launched
 minimised and every click and keystroke below still landed.)
 
+**Where the window sits, and how big it is, does not matter either.** The bridge never reads the
+window's position or its outer size; it works entirely inside the renderer's own coordinate space.
+On attach it pins that space (`Emulation.setDeviceMetricsOverride`, 1280×900), and on every action it
+re-reads the target's `getBoundingClientRect()` centre, re-checks with a hit test that the point
+really lands on the intended element, and waits 120 ms for the box to stop moving before clicking.
+Move the window, resize it, drag it half off-screen — the next action simply recomputes. Measured on
+a window that had just been dragged to a new position, same page read twice:
+
+| Reading | Composer | Send button | Viewport |
+|---|---|---|---|
+| real window layout (bridge detached) | (345, 689) 802×40 | (1119, 741) | 1244×802 |
+| the bridge's pinned canvas (after attach) | (345, 787) 838×40 | (1155, 839) | 1280×900 |
+
+The one geometric requirement is that the composer and its send button are **inside the viewport**:
+a window narrow enough to clip them is reported as a locate failure, never clicked blind. At 1244 px
+wide the send button ends at x=1147; on the pinned 1280-wide canvas, at x=1183.
+
 Apart from that, nothing is unusual: the same widgets, the same events, the same request path.
 
 | A person does | The bridge does |
@@ -219,6 +236,10 @@ paths).
 - **The client must be running** with the debug port. It does **not** need to be in the foreground:
   minimised, behind other windows, or unfocused all work, because events are delivered to the
   renderer rather than to the OS window.
+- **Window geometry is free — position and size are never read.** Every action recomputes the target's
+  centre in the renderer's own (pinned) coordinate space. The single geometric requirement is that the
+  composer and its send button stay inside the viewport; a window narrow enough to clip them is
+  reported as a locate failure, not clicked blind.
 - **Serial**: one conversation, one input box. The bridge queues; it does not parallelise.
 - **One new task per call** — the client keeps no history between calls, so send full context.
 - **Channel must be `Start Plan`.** The bridge checks the composer's model label every call and
