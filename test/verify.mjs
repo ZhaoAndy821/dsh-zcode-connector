@@ -8,7 +8,7 @@
  * Run: node test/verify.mjs
  */
 import { pathToFileURL } from 'node:url'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createDecipheriv, createHash } from 'node:crypto'
 import { homedir, platform, tmpdir, userInfo } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -46,12 +46,16 @@ const stub = {
 const config = host.Config({})
 host.apply(stub, config)
 
-check('registers exactly two routes', routes.length === 2, String(routes.length))
+check('registers three routes', routes.length === 3, String(routes.length))
 check('status route path', routes[0]?.path === '/plugins/dsh-zcode-connect/status', String(routes[0]?.path))
 check('panel route path', routes[1]?.path === '/plugins/dsh-zcode-connect/panel', String(routes[1]?.path))
-check('both routes are kind=exact', routes.every((route) => route.kind === 'exact'))
+check('bridge start route path', routes[2]?.path === '/plugins/dsh-zcode-connect/bridge/start', String(routes[2]?.path))
+check('all routes are kind=exact', routes.every((route) => route.kind === 'exact'))
 check('installs one settings section', sections.length === 1, String(sections.length))
 check('settings namespace matches the package', sections[0]?.[1] === 'dsh-zcode-connect', String(sections[0]?.[1]))
+check('bridge mode defaults to on-demand', config.bridgeMode === 'on-demand', String(config.bridgeMode))
+check('bridge mode accepts the three documented values', ['on-demand', 'auto', 'off'].every((mode) => host.Config({ bridgeMode: mode }).bridgeMode === mode))
+check('the bundled bridge script exists', existsSync(join(import.meta.dirname, '..', 'bridge', 'zcode-bridge.mjs')))
 
 /** Minimal response recorder. */
 function fakeResponse() {
@@ -73,6 +77,37 @@ function fakeResponse() {
   const response = fakeResponse()
   await routes[0].handler({ method: 'GET', socket: { remoteAddress: '::ffff:127.0.0.1' } }, response)
   check('status allows an IPv4-mapped loopback peer', response.captured.status === 200, String(response.captured.status))
+}
+// Starting a process is stronger than reading a snapshot, so the start route is guarded twice:
+// loopback only, and POST only.
+{
+  const response = fakeResponse()
+  await routes[2].handler({ method: 'POST', socket: { remoteAddress: '10.0.0.7' } }, response)
+  check('bridge start refuses a non-loopback peer', response.captured.status === 403, String(response.captured.status))
+}
+{
+  const response = fakeResponse()
+  await routes[2].handler({ method: 'GET', socket: { remoteAddress: '127.0.0.1' } }, response)
+  check('bridge start refuses GET', response.captured.status === 405, String(response.captured.status))
+}
+
+// ── 3b. the bridge lifecycle itself (on-demand start, reuse, stop) ──────────
+{
+  const bridge = await import(pathToFileURL(join(import.meta.dirname, '..', 'lib', 'bridge.js')).href)
+  const port = 9478
+  const before = await bridge.probeBridge(port, 800)
+  const started = await bridge.ensureBridge({ port, mode: 'on-demand', waitMs: 12_000 })
+  check('ensureBridge starts the bundled bridge on demand', before.reachable === false && started.reachable === true && started.started === true, JSON.stringify(started).slice(0, 140))
+  const reused = await bridge.ensureBridge({ port, mode: 'on-demand' })
+  check('a second call reuses the running bridge', reused.reachable === true && reused.started === false, JSON.stringify(reused))
+  const owned = bridge.bridgeOwned()
+  const stopped = bridge.stopBridge()
+  check('the process we started is ours to stop', owned !== null && stopped.stopped === true, JSON.stringify({ owned, stopped }))
+  await new Promise((resolve) => setTimeout(resolve, 800))
+  const after = await bridge.probeBridge(port, 800)
+  check('the bridge is gone after stop', after.reachable === false, JSON.stringify(after))
+  const off = await bridge.ensureBridge({ port, mode: 'off' })
+  check('mode=off never starts anything', off.started === false && off.reachable === false, JSON.stringify(off))
 }
 
 // ── 4. the real snapshot ────────────────────────────────────────────────────
@@ -98,6 +133,7 @@ if (snapshot) {
   if (plan) check('plan exposes entitlements', Array.isArray(plan.entitlements) && plan.entitlements.length > 0, `${plan.entitlements?.length ?? 0} entitlements`)
   check('balances carry a source', ['client-log', 'plan-api'].includes(snapshot.grant?.balancesSource), String(snapshot.grant?.balancesSource))
   check('no unexplained grant errors', (snapshot.grant?.errors ?? []).length === 0, JSON.stringify(snapshot.grant?.errors ?? []))
+  check('bridge mode is reported with the bridge state', ['on-demand', 'auto', 'off'].includes(snapshot.bridge?.mode), String(snapshot.bridge?.mode))
   check('capabilities read from the client config', Array.isArray(snapshot.capabilities?.channels) && snapshot.capabilities.channels.length > 0, `${snapshot.capabilities?.channels?.length ?? 0} channels`)
   check('builtin catalog located without config', typeof snapshot.capabilities?.catalogPath === 'string' && snapshot.capabilities.knownTemplates > 0, `${snapshot.capabilities?.knownTemplates ?? 0} templates at ${snapshot.capabilities?.catalogPath ?? '?'}`)
   check('installed view present (skills + MCP)', Array.isArray(snapshot.installed?.skills) && Array.isArray(snapshot.installed?.mcpServers), `${snapshot.installed?.skills?.length ?? 0} skills, ${snapshot.installed?.mcpServers?.length ?? 0} mcp`)

@@ -14,8 +14,9 @@
  *   5. ZCode 必须开着，但**不需要在前台**：最小化/被遮挡/未聚焦都行（事件投递给渲染进程，
  *      与窗口层级无关）；关掉它才会断。用户在同一对话里手动打字会干扰本次请求。
  *   6. **窗口位置和大小随便**：本桥从不读窗口坐标，也从不移动或缩放窗口。调用期间只把**页面自己的
- *      布局视口冻结在窗口当时的尺寸与 dpr**（仅当窗口报不出可用尺寸时才退回 VIEWPORT 默认值），
- *      调用一结束立即释放 —— 目的是让"量坐标 → 点击"之间不会因为窗口被拖动而漂移，画面不变。
+ *      布局视口冻结在窗口当前的尺寸与 dpr**，调用一结束立即释放 —— 目的是让"量坐标 → 点击"之间
+ *      不会因为窗口被拖动而漂移，画面不变。窗口报不出可用尺寸时沿用上一次真实读数（从未读到过就
+ *      不下发 override），**绝不**用一个窗口并不具备的固定尺寸去顶掉客户端自己的排版。
  *   7. ZCode 是 agent 不是裸模型：若它在 UI 里打开了项目目录，它可能真的去动文件。
  *   8. 上游报错会原样抛出（如 `[1113] 余额不足…`），不返回空串。
  *
@@ -30,10 +31,10 @@ import { join } from 'node:path'
 
 const HTTP_PORT = Number(process.env.ZCODE_BRIDGE_PORT ?? 9444)
 const CDP_PORT = Number(process.env.ZCODE_CDP_PORT ?? 9333)
-/** Only a fallback for when the window reports no usable size; the window's own size wins. */
-const VIEWPORT_FALLBACK = { width: Number(process.env.ZCODE_VIEWPORT_W ?? 1280), height: Number(process.env.ZCODE_VIEWPORT_H ?? 900) }
-/** Below this the window is not reporting a real layout at all (1400x1041 works fine). */
+/** Below this the window is not reporting a real layout at all (a minimized Electron window can read 0). */
 const MIN_VIEWPORT = { width: 640, height: 480 }
+/** The last size the window really reported; reused when it reports nothing usable. */
+let lastUsableViewport = null
 const REPLY_TIMEOUT_MS = Number(process.env.ZCODE_REPLY_TIMEOUT_MS ?? 240_000)
 const STABLE_SAMPLES = 3
 const SAMPLE_INTERVAL_MS = 1200
@@ -49,10 +50,24 @@ async function attach() {
   const socket = new WebSocket(page.webSocketDebuggerUrl)
   const pending = new Map()
   let nextId = 0
+  let closedReason = null
+
+  // Every pending call must settle, whatever happens to the socket. Without this, a call in
+  // flight when ZCode exits or reloads never settles: the reply deadline never runs, the HTTP
+  // request is never answered, and since the queue is a promise chain, every later zcode_ask
+  // waits forever behind it (measured symptom: /healthz reports inflight stuck > 0).
+  const failAll = (reason) => {
+    closedReason = closedReason ?? reason
+    for (const [, { reject }] of pending) reject(new Error(closedReason))
+    pending.clear()
+  }
+
   await new Promise((resolve, reject) => {
     socket.addEventListener('open', resolve, { once: true })
     socket.addEventListener('error', () => reject(new Error('CDP 连接失败')), { once: true })
   })
+  socket.addEventListener('close', () => failAll('CDP 连接已断开（ZCode 退出或页面重载）'))
+  socket.addEventListener('error', () => failAll('CDP 连接出错'))
   socket.addEventListener('message', (event) => {
     const message = JSON.parse(event.data)
     if (!message.id || !pending.has(message.id)) return
@@ -61,10 +76,19 @@ async function attach() {
     if (message.error) reject(new Error(JSON.stringify(message.error)))
     else resolve(message.result)
   })
+  // A send on a CLOSED WebSocket is silently discarded by spec (it does not throw), which would
+  // leave the promise below pending forever — so the readyState has to be checked explicitly.
   const send = (method, params = {}) => new Promise((resolve, reject) => {
+    if (closedReason !== null) return reject(new Error(closedReason))
+    if (socket.readyState !== 1) return reject(new Error(`CDP 连接不可用（readyState ${socket.readyState}）`))
     const id = ++nextId
     pending.set(id, { resolve, reject })
-    socket.send(JSON.stringify({ id, method, params }))
+    try {
+      socket.send(JSON.stringify({ id, method, params }))
+    } catch (error) {
+      pending.delete(id)
+      reject(new Error(`CDP 发送失败: ${error.message}`))
+    }
   })
   return { send, close: () => socket.close() }
 }
@@ -104,10 +128,17 @@ async function freezeViewport(cdp) {
   const usable = current !== null
     && Number.isFinite(current.w) && Number.isFinite(current.h)
     && current.w >= MIN_VIEWPORT.width && current.h >= MIN_VIEWPORT.height
-  const size = usable ? { width: Math.round(current.w), height: Math.round(current.h) } : VIEWPORT_FALLBACK
-  const deviceScaleFactor = usable && Number.isFinite(current.dpr) && current.dpr > 0 ? current.dpr : 1
-  await cdp.send('Emulation.setDeviceMetricsOverride', { ...size, deviceScaleFactor, mobile: false })
-  return { ...size, deviceScaleFactor, source: usable ? 'window' : 'fallback' }
+  if (usable) {
+    lastUsableViewport = { width: Math.round(current.w), height: Math.round(current.h), dpr: Number.isFinite(current.dpr) && current.dpr > 0 ? current.dpr : 1 }
+  }
+  // A window that reports nothing usable (a minimized Electron window can read 0) must NOT be
+  // answered with a hard-coded 1280x900: that is the "announce a size the window does not have"
+  // case which pushes the composer off the bottom of the window. Reuse the last real reading,
+  // and if there has never been one, leave the page alone and let the hit test decide.
+  const target = usable ? lastUsableViewport : lastUsableViewport
+  if (target === null) return { width: null, height: null, deviceScaleFactor: null, source: 'none' }
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width: target.width, height: target.height, deviceScaleFactor: target.dpr, mobile: false })
+  return { width: target.width, height: target.height, dpr: target.dpr, deviceScaleFactor: target.dpr, source: usable ? 'window' : 'last-window' }
 }
 
 /** Hand the page back its own layout. Safe to call on a session that is already gone. */
@@ -406,7 +437,9 @@ const server = createServer(async (request, response) => {
       const cdp = await attach()
       try {
         const frozen = await freezeViewport(cdp)
-        console.log(`[bridge] viewport frozen at ${frozen.width}x${frozen.height} @${frozen.deviceScaleFactor}x (source: ${frozen.source})`)
+        console.log(frozen.source === 'none'
+          ? '[bridge] viewport left as the window reports it (no usable size read yet)'
+          : `[bridge] viewport frozen at ${frozen.width}x${frozen.height} @${frozen.deviceScaleFactor}x (source: ${frozen.source})`)
         await newTask(cdp)
         const channel = await ensureStartPlan(cdp)
         const transcriptsBefore = transcriptSizes()
@@ -438,6 +471,6 @@ const server = createServer(async (request, response) => {
 })
 
 server.listen(HTTP_PORT, '127.0.0.1', () => {
-  console.log(`zcode-bridge on http://127.0.0.1:${HTTP_PORT}  (CDP ${CDP_PORT}; the window's own viewport is frozen per request, fallback ${VIEWPORT_FALLBACK.width}x${VIEWPORT_FALLBACK.height})`)
+  console.log(`zcode-bridge on http://127.0.0.1:${HTTP_PORT}  (CDP ${CDP_PORT}; each request freezes the window's own viewport and releases it afterwards)`)
   console.log('限制: ZCode 必须开着(带调试端口) · 串行 · 每请求新对话 · 频道必须是 Start Plan')
 })

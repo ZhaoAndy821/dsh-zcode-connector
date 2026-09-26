@@ -28,9 +28,9 @@
  *       toolCallTimeoutMs: 300000
  *       failOnStartupError: false
  */
-import { fileURLToPath } from 'node:url'
 import { collectStatus } from '../lib/status.js'
 import { describeRuns } from '../lib/runs.js'
+import { ensureBridge } from '../lib/bridge.js'
 import { installAgent, installMcpServer, installSkill, listInstalled, removeAgent, removeMcpServer, removeSkill } from '../lib/provision.js'
 
 const PROTOCOL_VERSION = '2025-06-18'
@@ -39,14 +39,6 @@ const SUPPORTED_PROTOCOLS = ['2025-06-18', '2024-11-05']
 const BRIDGE_URL = process.env.ZCODE_BRIDGE_URL ?? 'http://127.0.0.1:9444/v1/chat/completions'
 const DEBUG_PORT = Number(process.env.ZCODE_DEBUG_PORT ?? 9333)
 const BRIDGE_PORT = Number(process.env.ZCODE_BRIDGE_PORT ?? 9444)
-/**
- * Where the bridge script actually lives, resolved from this file's own location.
- *
- * The hint in `zcode_ask`'s failure path has to name a path the reader can act on, so it is
- * derived at runtime rather than written down — a literal path would only be correct on the
- * machine it was typed on.
- */
-const BRIDGE_PATH = fileURLToPath(new URL('../bridge/zcode-bridge.mjs', import.meta.url))
 
 const TOOLS = [
   {
@@ -262,6 +254,25 @@ async function callTool(name, args) {
     const prompt = typeof args?.prompt === 'string' ? args.prompt.trim() : ''
     if (!prompt) throw new Error('zcode_ask requires a non-empty "prompt" string')
 
+    // On-demand bridge: nothing starts the GUI bridge at boot (the plugin's default mode), so the
+    // first call that actually needs it starts it. `ZCODE_BRIDGE_MODE`/`ZCODE_BRIDGE_SCRIPT` come
+    // from the environment when the profile wires this server up.
+    const bridgeMode = process.env.ZCODE_BRIDGE_MODE ?? 'on-demand'
+    if (bridgeMode !== 'off') {
+      const ensured = await ensureBridge({
+        port: BRIDGE_PORT,
+        script: process.env.ZCODE_BRIDGE_SCRIPT,
+        mode: 'on-demand',
+      })
+      if (!ensured.reachable) {
+        throw new Error(
+          `the ZCode GUI bridge is not answering on 127.0.0.1:${BRIDGE_PORT} and could not be started ` +
+            `(${ensured.error ?? 'unknown reason'}). Start it with: node <plugin>/bridge/zcode-bridge.mjs ` +
+            `— and make sure ZCode runs with --remote-debugging-port=${DEBUG_PORT}.`,
+        )
+      }
+    }
+
     let response
     try {
       response = await fetch(BRIDGE_URL, {
@@ -272,7 +283,7 @@ async function callTool(name, args) {
     } catch (error) {
       throw new Error(
         `cannot reach the ZCode bridge at ${BRIDGE_URL} (${error.message}). ` +
-          `Start it with: node ${BRIDGE_PATH} — and make sure ZCode runs with --remote-debugging-port=${DEBUG_PORT}.`,
+          `Start it with: node <plugin>/bridge/zcode-bridge.mjs — and make sure ZCode runs with --remote-debugging-port=${DEBUG_PORT}.`,
       )
     }
     const text = await response.text()

@@ -4,15 +4,26 @@
 # Start Plan grant is account-bound (`access.type: zhipu-account`) and its only
 # inference route needs the Aliyun captcha proof that ZCode's own renderer mints
 # (direct calls answer 3007 — measured). So the plugin observes the running client
-# over CDP and shows what it finds: the account, the plan, the remaining quota, and
-# the capabilities the app currently has loaded.
+# over CDP and shows what it finds: the account, the plan, the remaining quota, the
+# capabilities the app currently has loaded, and what the client is running in the
+# background (its own subagents, tasks and scheduled work).
 #
 # Ports:
 #   debugPort  9333  ZCode must be launched with --remote-debugging-port=9333
-#   bridgePort 9444  bridge/zcode-bridge.mjs, when that helper is running
+#   bridgePort 9444  the GUI bridge (bridge/zcode-bridge.mjs, shipped in this plugin)
+#
+# bridgeMode — who starts that bridge process:
+#   on-demand (default)  nothing starts it at boot; the first thing that needs it does
+#                        (an MCP zcode_ask, or the panel's 「按需启动桥」 button)
+#   auto                 started while this plugin loads, stopped again when it unloads
+#   off                  never managed here, reachability is only reported
+#
+# bridgeScript — override the script to spawn; empty means the copy bundled with the
+# plugin (which is what a normal install wants).
 - insert:
     - id: zcode-connect
       name: dsh-zcode-connect
       config:
         debugPort: 9333
         bridgePort: 9444
+        bridgeMode: on-demand

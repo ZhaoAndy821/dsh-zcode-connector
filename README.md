@@ -7,8 +7,8 @@ It ships three things:
 
 | Piece | What it does |
 |---|---|
-| `bridge/zcode-bridge.mjs` | Local OpenAI-compatible endpoint (`POST /v1/chat/completions`) that types a prompt into the running ZCode window, waits for the turn to finish, and returns the answer |
-| plugin `dsh-zcode-connect` | Host half with a loopback status route + a self-contained HTML panel (account, plan, live quota, loaded capabilities, what this connector installed, and what the client is running in the background right now) |
+| `bridge/zcode-bridge.mjs` | Local OpenAI-compatible endpoint (`POST /v1/chat/completions`) that types a prompt into the running ZCode window, waits for the turn to finish, and returns the answer; the plugin ships this same file and starts it on demand |
+| plugin `dsh-zcode-connect` | Host half with three loopback routes (status JSON, the HTML panel, and an on-demand bridge start) plus a client half that puts the panel in DSH's right sidebar as a tab — account, plan, live quota, loaded capabilities, what this connector installed, and what the client is running in the background right now |
 | `mcp/server.mjs` | MCP stdio server exposing status, background runs, ask, and provisioning tools to any MCP client (DSH consumes it through `@deepseek-ai/dsh-mcp-client`) |
 
 ## Why drive the GUI instead of using an API key
@@ -128,6 +128,23 @@ This is also what makes long runs safe to hand over. A thinking-heavy turn can o
 wait budget — the call returns a timeout, the client keeps working — and the run stays observable
 instead of being lost with the call.
 
+## Where it appears: a tab in the right sidebar
+
+The panel is not a page you have to go and open. The plugin ships a **client half** that registers it
+as a tab next to Subagents and Tasks in DSH's right sidebar, and Settings → Plugins → ZCode carries
+the switch that adds or removes it (a per-browser preference, on by default).
+
+Three extension points make that tab, all of them DSH's own:
+
+| What | Registered into | Notes |
+|---|---|---|
+| the tab type | `ctx.sidebarRightTabs.register({ id, kind, priority, title, guide })` | a `kind` of its own, so it cannot collide with Files/Tasks; the `guide` capsule is how it shows up in the sidebar's list |
+| its body | slot `sidebar.right.pane.tab`, keyed by that id | an `iframe` of the host route below, so the view has one implementation, not two |
+| its chip title | slot `sidebar.right.pane.tab.title`, keyed by the same id | glyph + the title the frame hands in |
+
+The same shape works for any DSH plugin that wants a right-sidebar panel; `lib/client.js` is a
+prebuilt bundle (no bundler — it is already in the `__ModuleLoader__.load` envelope).
+
 ## Extensibility: turn ZCode into a grunt-work executor
 
 ZCode is an extension platform in its own right, and this connector exposes that surface over MCP,
@@ -163,13 +180,24 @@ points, which is why the pattern is worth publishing as a template rather than a
 
 ## Install
 
-### 1. The bridge
+### 1. The bridge (shipped here; the plugin can start it for you)
 
 ```bash
 node bridge/zcode-bridge.mjs           # listens on 127.0.0.1:9444
 ```
 
 `POST /v1/chat/completions` (OpenAI-shaped, non-streaming). `GET /healthz` reports the queue depth.
+
+The plugin ships its own copy of that file and owns the process, so you do not have to start it by
+hand. `bridgeMode` decides who does:
+
+| `bridgeMode` | Who starts it |
+|---|---|
+| `on-demand` (**default**) | nobody at boot — the first thing that needs it does: an MCP `zcode_ask`, or the panel's 「start the bridge」 button |
+| `auto` | the plugin starts it while loading and stops it again when it unloads |
+| `off` | the plugin never touches the process; it only reports whether the port answers |
+
+`bridgeScript` overrides which file gets spawned; empty means the copy bundled with the plugin.
 
 ### 2. The plugin (DSH)
 
@@ -190,9 +218,17 @@ dependency bridge: `<repo>/node_modules/@deepseek-ai` →
 - id: zcode-connect
   name: dsh-zcode-connect
   config:
-    debugPort: 9333      # ZCode's --remote-debugging-port
-    bridgePort: 9444     # the bridge above
+    debugPort: 9333          # ZCode's --remote-debugging-port
+    bridgePort: 9444         # the bridge above
+    bridgeMode: on-demand    # on-demand | auto | off — see the table above
 ```
+
+> **The client half is fail-closed — do not half-declare it.** `package.json` declares
+> `exports["./client"]` and `dsh.client`, and `lib/client.js` must therefore exist. DSH composes
+> client bundles at startup and *refuses to boot* when a declaration resolves to no file
+> (`ClientPackageCompositionError`; observed as the launcher bringing `dsh` up and it exiting a few
+> seconds later). Shipping both together is the only valid state; if you ever remove
+> `lib/client.js`, remove those two declarations in the same commit.
 
 ### 3. The MCP server (optional, but this is the convenient surface)
 
@@ -249,6 +285,9 @@ paths).
   being clicked, and it is released when the request ends — a per-request freeze, not a resize of your
   window.
 - **Serial**: one conversation, one input box. The bridge queues; it does not parallelise.
+- **The bridge is a separate process, and this plugin owns it.** `bridgeMode` decides whether it is
+  started on demand (default), at load, or never; a bridge that was already running is reused, and one
+  this plugin did not start is never stopped.
 - **One new task per call** — the client keeps no history between calls, so send full context.
 - **Channel must be `Start Plan`.** The bridge checks the composer's model label every call and
   switches it if it reads the metered `bigmodel-api/…` channel instead.
@@ -284,14 +323,17 @@ capacity is available (that one is free — it does not spend the grant).
 
 ```
 bridge/zcode-bridge.mjs      OpenAI-compatible endpoint driving the GUI over CDP
-lib/index.js                 plugin host half: status route + panel route (loopback only)
+lib/index.js                 plugin host half: status + panel + bridge-start routes (loopback only)
 lib/status.js                CDP probe, credential decrypt, plan/quota, capabilities
 lib/runs.js                  background runs: subagents, client log activity, task index
+lib/bridge.js                bridge lifecycle: probe / start on demand / own the process
+lib/client.js                client half: registers the right-sidebar tab + the settings card
 lib/panel.js                 self-contained HTML panel (no build step, no React)
 lib/provision.js             install/remove skills, subagent roles, MCP servers
 mcp/server.mjs               MCP stdio server (zero dependencies, hand-rolled JSON-RPC)
 skills/                      the handoff / grunt-batch / fan-out skill texts
-test/verify.mjs              self-check: exports, routing, loopback guard, run parsing, no token leakage
+test/verify.mjs              self-check: exports, routing, loopback guard, run parsing, token leakage
+test/client-bundle.mjs       self-check: the client half's slot contract and its switch
 ```
 
 ## Privacy
@@ -309,16 +351,21 @@ self-check asserts that too (`no prompt text leaks into the snapshot`).
 ## Self-check
 
 ```bash
-node test/verify.mjs
+node test/verify.mjs          # host half
+node test/client-bundle.mjs   # client half
 ```
 
-It asserts the export surface, both route registrations, the loopback guard, the live status
-snapshot, the background-run view against a synthetic client home (a run without a completion stamp
-must read as running, an open inference request must read as generating, a finished run must carry
-its own report), and — most importantly — that neither the status JSON nor the panel HTML can leak
-the account token.
+`verify.mjs` asserts the export surface, the three route registrations, the loopback guard, the live
+status snapshot, the background-run view against a synthetic client home (a run without a completion
+stamp must read as running, an open inference request must read as generating, a finished run must
+carry its own report), the bridge lifecycle against a real process it starts and stops itself, and —
+most importantly — that neither the status JSON nor the panel HTML can leak the account token.
 
-The plugin imports `@deepseek-ai/schemastery`, so the check uses the same dependency bridge the
+`client-bundle.mjs` runs `lib/client.js` the way the client does (`window.__ModuleLoader__.load`) and
+asserts the tab contract: a tab type in `sidebarRightTabs`, a body and a chip title keyed by the same
+id, a settings card under this plugin's namespace, and a switch that adds and removes all three.
+
+The plugin imports `@deepseek-ai/schemastery`, so the checks use the same dependency bridge the
 install section describes.
 
 ## License

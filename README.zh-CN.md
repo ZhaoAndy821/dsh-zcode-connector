@@ -120,14 +120,29 @@ ZCode 干活是在**它自己的进程里**干的：主 agent 派发 subagent、
 
 这也让长任务敢交出去：一个高强度思考的轮次可能超过调用方自己的等待上限 —— 调用返回超时，客户端还在继续干 —— 而这次运行仍然可见，不会随着调用一起消失。
 
-## 两个路由
+## 它出现在哪：右侧栏的一个标签页
+
+面板不是一个"要自己去找的页面"。插件自带**客户端半边**，把它注册成 DSH 右侧栏里与 Subagents、Tasks 并列的标签页；设置 → 插件 → ZCode 里那个开关决定它的去留（按浏览器保存，默认开）。
+
+这个标签页由 DSH 自己的三个扩展点组成：
+
+| 组成 | 注册到 | 说明 |
+|---|---|---|
+| 标签类型 | `ctx.sidebarRightTabs.register({ id, kind, priority, title, guide })` | 自己占一个 `kind`，不会和 Files/Tasks 撞车；`guide` 胶囊是它在右侧栏列表里的入口 |
+| 正文 | 槽位 `sidebar.right.pane.tab`，用同一个 id 作 key | 正文是宿主路由的 `iframe` —— 视图只有一份实现，不重复写第二套 UI |
+| 标题 chip | 槽位 `sidebar.right.pane.tab.title`，同一个 id | 图标 + 由框架传入的标题 |
+
+同样的形状适用于任何想在右栏加面板的 DSH 插件；`lib/client.js` 是**预先构建好的 bundle**（无需打包器，它本身就在 `__ModuleLoader__.load` 外壳里）。
+
+## 三个路由
 
 | 路由 | 内容 |
 |---|---|
 | `GET /plugins/dsh-zcode-connect/status` | JSON 快照（面板与脚本都用它） |
 | `GET /plugins/dsh-zcode-connect/panel` | 自包含 HTML 面板（无构建步骤、无 React） |
+| `POST /plugins/dsh-zcode-connect/bridge/start` | 按需拉起 GUI 桥（`bridgeMode: on-demand` 时用） |
 
-两条都是**仅回环**：`request.socket.remoteAddress` 必须是 loopback，否则 403。
+三条都是**仅回环**：`request.socket.remoteAddress` 必须是 loopback，否则 403；起进程那条还只接受 POST。
 
 ## 认证与密钥
 
@@ -151,6 +166,7 @@ cipher = aes-256-gcm
 5. 状态有 15 秒缓存（`cacheMs`），避免频繁打套餐接口。
 6. 余额是**周末活动额度**，`expires_at` 到了就归零；它按天重置，面板显示的永远是当前可用。
 7. 高思考强度的一轮可能比调用方自己的等待上限还长：调用方会拿到超时，客户端仍在继续干。这时用 `zcode_runs` 或面板看那次运行 —— 它不会因为调用超时而消失。
+8. **桥是独立进程，由本插件托管**：`bridgeMode` 决定它是按需启动（默认）、随插件加载启动，还是完全不管；已经在跑的桥会被复用，**不是自己起的桥绝不停掉**。
 
 ## 配置
 
@@ -158,10 +174,12 @@ cipher = aes-256-gcm
 - id: zcode-connect
   name: dsh-zcode-connect
   config:
-    debugPort: 9333      # ZCode 的远程调试端口
-    bridgePort: 9444     # bridge/zcode-bridge.mjs 的健康端口
+    debugPort: 9333          # ZCode 的远程调试端口
+    bridgePort: 9444         # bridge/zcode-bridge.mjs 的健康端口
+    bridgeMode: on-demand    # on-demand（默认）| auto | off —— 见上一条
     cacheMs: 15000
     # catalogPath: <可选> 客户端内置目录，用于列出"已知模板"数量
+    # bridgeScript: <可选> 要拉起的桥脚本；留空表示用插件自带那份
 ```
 
 ## 安装与挂载
@@ -172,6 +190,13 @@ cipher = aes-256-gcm
 2. 依赖桥：`<插件>/node_modules/@deepseek-ai` → junction 到
    `%USERPROFILE%/.dsh/profiles/node_modules/@deepseek-ai`
 3. **重启宿主**后生效
+
+> **客户端半边是 fail-closed 的：不要"半声明"。** `package.json` 声明了 `exports["./client"]` 与
+> `dsh.client`，那么 `lib/client.js` **必须存在**。DSH 在启动时合成客户端 bundle，一旦声明解析不到
+> 文件就抛 `ClientPackageCompositionError` —— 不是跳过这个插件，而是**整个 harness 拒绝启动**
+> （实测表现：启动器把 dsh 拉起来，约 5 秒后自己退出）。两者必须同进同退：要删 `lib/client.js`，
+> 就在同一个提交里把这两处声明一起删掉。
+
 
 ## MCP 服务器（`mcp/server.mjs`）
 
@@ -251,22 +276,20 @@ Agent 工具面里还有 `CronCreate` / `CronList` / `CronDelete` / `Monitor` / 
     failOnStartupError: false
 ```
 
-前提：ZCode 带 `--remote-debugging-port=9333` 在跑，且 `bridge/zcode-bridge.mjs` 在 9444 上。
-缺哪个，`zcode_ask` 的报错就会点名哪一个（不会静默失败）。
+前提：ZCode 带 `--remote-debugging-port=9333` 在跑，且桥在 9444 上（`bridgeMode: on-demand` 时，第一次
+`zcode_ask` 会自己把它拉起来）。缺哪个，`zcode_ask` 的报错就会点名哪一个（不会静默失败）。
 
 ## 自检
 
 ```powershell
-node test/verify.mjs      # 导出面 / 路由接线 / 回环校验 / 无 token 泄漏 / 真实快照
-                          # + 后台运行记录解析（合成客户端目录：未完成的算运行中、
-                          #   有打开的推理请求算生成中、已完成的必须带出自己的报告）
+node test/verify.mjs          # 宿主半边：导出面 / 三个路由 / 回环校验 / 真实快照 / 无 token 泄漏
+                              # + 后台运行记录解析（合成客户端目录）
+                              # + 桥的生命周期（真起一个进程再停掉）
+node test/client-bundle.mjs   # 客户端半边：按 DSH 的方式加载 bundle，校验标签页契约与开关
 ```
 
 ## 面板形态
 
-现在的面板是一张**自包含 HTML 页**（`/plugins/dsh-zcode-connect/panel`）：零构建步骤、零前端依赖，
-在任何浏览器或 DSH 侧栏里都能直接打开。
-
-想升级成原生 React 卡片时：用官方 `dsh.client` 打包流程把客户端半边产出为 combo bundle
-（`exports["./client"]`），注册到 `settings.plugin.item`，key 用 `dsh-zcode-connect` —— 宿主半边
-已经用 `installSection` 提供好这个命名空间，卡片不需要任何 key 字段。
+面板是一张**自包含 HTML 页**（`/plugins/dsh-zcode-connect/panel`）：零构建步骤、零前端依赖，浏览器里能直接开。
+而在 DSH 内部，它由客户端半边注册成**右侧栏的一个标签页**（与 Subagents / Tasks 并列），开关在
+设置 → 插件 → ZCode 里；标签正文就是这个路由的 iframe。
