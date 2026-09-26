@@ -28,14 +28,25 @@
  *       toolCallTimeoutMs: 300000
  *       failOnStartupError: false
  */
+import { fileURLToPath } from 'node:url'
 import { collectStatus } from '../lib/status.js'
 import { describeRuns } from '../lib/runs.js'
 import { installAgent, installMcpServer, installSkill, listInstalled, removeAgent, removeMcpServer, removeSkill } from '../lib/provision.js'
 
 const PROTOCOL_VERSION = '2025-06-18'
+/** Versions this server speaks; anything else is answered with PROTOCOL_VERSION. */
+const SUPPORTED_PROTOCOLS = ['2025-06-18', '2024-11-05']
 const BRIDGE_URL = process.env.ZCODE_BRIDGE_URL ?? 'http://127.0.0.1:9444/v1/chat/completions'
 const DEBUG_PORT = Number(process.env.ZCODE_DEBUG_PORT ?? 9333)
 const BRIDGE_PORT = Number(process.env.ZCODE_BRIDGE_PORT ?? 9444)
+/**
+ * Where the bridge script actually lives, resolved from this file's own location.
+ *
+ * The hint in `zcode_ask`'s failure path has to name a path the reader can act on, so it is
+ * derived at runtime rather than written down — a literal path would only be correct on the
+ * machine it was typed on.
+ */
+const BRIDGE_PATH = fileURLToPath(new URL('../bridge/zcode-bridge.mjs', import.meta.url))
 
 const TOOLS = [
   {
@@ -261,7 +272,7 @@ async function callTool(name, args) {
     } catch (error) {
       throw new Error(
         `cannot reach the ZCode bridge at ${BRIDGE_URL} (${error.message}). ` +
-          `Start it with: node D:/GitHub/bridge/zcode-bridge.mjs — and make sure ZCode runs with --remote-debugging-port=${DEBUG_PORT}.`,
+          `Start it with: node ${BRIDGE_PATH} — and make sure ZCode runs with --remote-debugging-port=${DEBUG_PORT}.`,
       )
     }
     const text = await response.text()
@@ -365,11 +376,15 @@ async function handle(request) {
   const { id, method, params } = request
   try {
     if (method === 'initialize') {
+      // Reply with a version this server actually implements. Echoing whatever the client asked
+      // for would "accept" a version we do not speak (measured: asked 2024-11-05, echoed back).
+      const requested = params?.protocolVersion
+      const agreed = SUPPORTED_PROTOCOLS.includes(requested) ? requested : PROTOCOL_VERSION
       send({
         jsonrpc: '2.0',
         id,
         result: {
-          protocolVersion: typeof params?.protocolVersion === 'string' ? params.protocolVersion : PROTOCOL_VERSION,
+          protocolVersion: agreed,
           capabilities: { tools: {} },
           serverInfo: { name: 'zcode-connect', version: '0.1.0' },
         },
@@ -381,7 +396,13 @@ async function handle(request) {
       return
     }
     if (method === 'tools/call') {
-      const outcome = await callTool(params?.name, params?.arguments)
+      const toolName = params?.name
+      if (!TOOLS.some((tool) => tool.name === toolName)) {
+        // An unknown tool is a request error, not a tool result: -32602 Invalid params.
+        send({ jsonrpc: '2.0', id, error: { code: -32602, message: `unknown tool: ${String(toolName)}` } })
+        return
+      }
+      const outcome = await callTool(toolName, params?.arguments)
       send({
         jsonrpc: '2.0',
         id,

@@ -1,0 +1,17 @@
+# 把仓库内与工作区里的文本文件统一为 LF。
+#
+# 为什么需要它：没有它时，Windows 上 checkout 会把工作区 smudge 成 CRLF，而 blob 仍是 LF ——
+# 于是同一个提交在不同机器上产出不同字节，动一个无关的地方也会让整个文件显示成"已修改"，
+# 任何按字节做的比对（或把文件哈希贴进 issue）都不再可复现。
+#
+# 实测：本文件加入之前，README.zh-CN.md 就已经是"blob 存 LF、checkout 成 CRLF"的状态。
+* text=auto eol=lf
+
+# 二进制资源：永不改动其行尾。
+*.mp4  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.ico  binary

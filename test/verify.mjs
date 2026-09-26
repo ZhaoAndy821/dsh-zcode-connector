@@ -99,13 +99,16 @@ if (snapshot) {
   check('balances carry a source', ['client-log', 'plan-api'].includes(snapshot.grant?.balancesSource), String(snapshot.grant?.balancesSource))
   check('no unexplained grant errors', (snapshot.grant?.errors ?? []).length === 0, JSON.stringify(snapshot.grant?.errors ?? []))
   check('capabilities read from the client config', Array.isArray(snapshot.capabilities?.channels) && snapshot.capabilities.channels.length > 0, `${snapshot.capabilities?.channels?.length ?? 0} channels`)
+  check('builtin catalog located without config', typeof snapshot.capabilities?.catalogPath === 'string' && snapshot.capabilities.knownTemplates > 0, `${snapshot.capabilities?.knownTemplates ?? 0} templates at ${snapshot.capabilities?.catalogPath ?? '?'}`)
   check('installed view present (skills + MCP)', Array.isArray(snapshot.installed?.skills) && Array.isArray(snapshot.installed?.mcpServers), `${snapshot.installed?.skills?.length ?? 0} skills, ${snapshot.installed?.mcpServers?.length ?? 0} mcp`)
   check('background runs view present', snapshot.runs !== null && Array.isArray(snapshot.runs?.agents), `${snapshot.runs?.agents?.length ?? 0} subagent runs`)
   check('runs view carries a live section', snapshot.runs?.live !== null && typeof snapshot.runs?.live?.busy === 'boolean', JSON.stringify(snapshot.runs?.live?.openRequests ?? null))
+  check('runs view carries the main agent', typeof snapshot.runs?.live?.main?.sessionId === 'string', JSON.stringify(snapshot.runs?.live?.main ?? null).slice(0, 120))
+  check('main agent reports what it dispatched', typeof snapshot.runs?.live?.main?.agents === 'number' && typeof snapshot.runs?.live?.main?.toolCalls === 'number', `agents=${snapshot.runs?.live?.main?.agents} toolCalls=${snapshot.runs?.live?.main?.toolCalls}`)
   check('runs view reports its sources', Boolean(snapshot.runs?.roots?.agents && snapshot.runs?.roots?.rollout), JSON.stringify(snapshot.runs?.roots ?? {}))
   check('runs view reads the client task index', snapshot.runs?.indexAvailable === true && Array.isArray(snapshot.runs?.tasks), `${snapshot.runs?.tasks?.length ?? 0} tasks`)
   check('runs view reads the client log', snapshot.runs?.activityAvailable === true, String(snapshot.runs?.activityAvailable))
-  check('recorded runs carry a role and a status', (snapshot.runs?.agents ?? []).every((run) => typeof run.role === 'string' && typeof run.status === 'string'))
+  check('recorded runs carry a role and a status', (snapshot.runs?.agents ?? []).length > 0 && (snapshot.runs?.agents ?? []).every((run) => typeof run.role === 'string' && typeof run.status === 'string'), `${snapshot.runs?.agents?.length ?? 0} runs checked`)
   check('recorded runs carry a per-run report summary', (snapshot.runs?.agents ?? []).some((run) => run.counts !== null || run.outcome !== null), `${(snapshot.runs?.agents ?? []).filter((run) => run.hasReport).length} with a report`)
 }
 
@@ -124,7 +127,7 @@ if (snapshot) {
 
   check('status JSON does not contain the account token', !statusResponse.captured.body.includes(token))
   check('status JSON carries no enc:v1 envelope', !statusResponse.captured.body.includes(PREFIX))
-  check('status JSON carries no subagent prompt text', !/"prompt"/.test(statusResponse.captured.body) && !/"systemPrompt"/.test(statusResponse.captured.body))
+  check('status JSON has no prompt field', !/"prompt"/.test(statusResponse.captured.body) && !/"systemPrompt"/.test(statusResponse.captured.body))
 
   const panelResponse = fakeResponse()
   routes[1].handler({ method: 'GET', socket: { remoteAddress: '127.0.0.1' } }, panelResponse)
@@ -133,8 +136,21 @@ if (snapshot) {
   check('panel HTML does not contain the account token', !panelResponse.captured.body.includes(token))
   check('panel has no API-key input (not a provider card)', !/<input[^>]+type=["']?password/i.test(panelResponse.captured.body) && !/api[_-]?key/i.test(panelResponse.captured.body.replace(/API key/g, '')), '')
   check('panel has the background-run section', panelResponse.captured.body.includes('ZCode 后台') && panelResponse.captured.body.includes('subagent'))
+  check('panel shows the main agent', panelResponse.captured.body.includes('主 Agent') && panelResponse.captured.body.includes('派发 subagent'))
   check('panel has the scheduled-run section', panelResponse.captured.body.includes('定时与空闲任务'))
-  check('panel escapes client-sourced text', panelResponse.captured.body.includes('const esc ='))
+  // Behavioural, not textual: pull the panel's own `esc` out of the served document and feed it a
+  // payload. Asserting that the string "const esc =" exists would pass even if nothing called it.
+  {
+    const source = /const esc = [\s\S]*?\n(?=const fmt)/.exec(panelResponse.captured.body)?.[0] ?? ''
+    let escaped = null
+    try {
+      escaped = new Function(`${source}; return esc;`)()('<img src=x onerror="alert(1)"> & \'q\'')
+    } catch (error) {
+      escaped = `threw: ${error.message}`
+    }
+    check('panel escaping defuses a payload', typeof escaped === 'string' && !escaped.includes('<') && !escaped.includes('>') && !escaped.includes('"') && escaped.includes('&lt;img'), String(escaped).slice(0, 60))
+    check('panel escapes client-sourced interpolations', (panelResponse.captured.body.match(/esc\(/g) ?? []).length > 12, `${(panelResponse.captured.body.match(/esc\(/g) ?? []).length} call sites`)
+  }
   check('panel draws a live indicator', panelResponse.captured.body.includes('live-dot') && panelResponse.captured.body.includes('renderRuns'))
   check('panel refreshes faster than the old 30 s', /setInterval\(load,\s*15000\)/.test(panelResponse.captured.body))
 }
@@ -207,11 +223,27 @@ if (snapshot) {
   )
   transcript(`sess_subagent_${runningAgentId}`, 'Edit', 2)
   transcript('sess_parent-1', 'Agent', 1)
+  // A session with no runs at all, written last so it is the newest rollout file. The "main agent"
+  // must NOT be this one: measured live, the newest rollout file is not necessarily the session
+  // that owns the runs, which produced a card claiming "dispatched 0 subagents" above nine runs.
+  transcript('sess_decoy-newest', 'Bash', 1)
   write(`cli/log/zcode-${stamp}.jsonl`, [
     JSON.stringify({ timestamp: new Date(Date.now() - 20_000).toISOString(), event: 'turn.phase.started', module: 'core.runtime', sessionId: `sess_subagent_${runningAgentId}`, context: JSON.stringify({ phase: 'regular_turn_loop', turnNumber: 0 }) }),
     JSON.stringify({ timestamp: new Date(Date.now() - 4000).toISOString(), event: 'tool.call.started', module: 'core.tool.executor', sessionId: `sess_subagent_${runningAgentId}`, context: JSON.stringify({ toolName: 'Edit', agentId: runningAgentId, agentType: 'dsh-batch-worker', parentSessionId: 'sess_parent-1', iteration: 3 }) }),
     JSON.stringify({ timestamp: new Date(Date.now() - 2000).toISOString(), event: 'model.request.started', module: 'core.runtime', sessionId: `sess_subagent_${runningAgentId}`, context: JSON.stringify({ queryId: 'query_fixture', iteration: 3, modelId: 'GLM-5.3-Flash' }) }),
+    // A request that failed and was retried under a NEW queryId: nothing ever closes the first key.
+    // Measured in the live log (one occurrence), and while it lingers it reads as "generating".
+    JSON.stringify({ timestamp: new Date(Date.now() - 1500).toISOString(), event: 'model.request.started', module: 'core.runtime', sessionId: 'sess_decoy-newest', context: JSON.stringify({ queryId: 'query_failed', iteration: 1 }) }),
+    JSON.stringify({ timestamp: new Date(Date.now() - 1400).toISOString(), event: 'model.request.failed', module: 'adapters.model', sessionId: 'sess_decoy-newest', context: JSON.stringify({ queryId: 'query_failed' }) }),
     JSON.stringify({ timestamp: new Date(Date.now() - 60_000).toISOString(), event: 'zcode_protocol.process.memory_sample', module: 'bootstrap.zcode_protocol', context: '{"rssKb":1}' }),
+  ].join('\n') + '\n')
+
+  // A second home whose log carries nothing but the idle heartbeat: no turn-level event at all.
+  const quiet = mkdtempSync(join(tmpdir(), 'zcode-quiet-'))
+  mkdirSync(join(quiet, 'cli', 'log'), { recursive: true })
+  writeFileSync(join(quiet, 'cli', 'log', `zcode-${stamp}.jsonl`), [
+    JSON.stringify({ timestamp: new Date(Date.now() - 30_000).toISOString(), event: 'zcode_protocol.process.memory_sample', module: 'bootstrap.zcode_protocol', context: '{"rssKb":1}' }),
+    JSON.stringify({ timestamp: new Date(Date.now() - 5_000).toISOString(), event: 'zcode_protocol.process.memory_sample', module: 'bootstrap.zcode_protocol', context: '{"rssKb":2}' }),
   ].join('\n') + '\n')
 
   const parsed = runsModule.parseReport('outcome: partial\ncounts: processed=3 changed=1 skipped=1 failed=1\nCHANGED: D:/x\nFAILED:  D:/y — boom\n')
@@ -226,16 +258,31 @@ if (snapshot) {
   check('fixture: open request marks it generating', running?.generating === true && runs.live.generating === true && runs.live.openRequests === 1, JSON.stringify({ generating: running?.generating, open: runs.live.openRequests }))
   check('fixture: the live tool call is surfaced', running?.activity?.lastTool === 'Edit' && running?.currentTool?.name === 'Edit', JSON.stringify(running?.activity ?? null))
   check('fixture: the live phase is surfaced', running?.activity?.phase === 'regular_turn_loop' && running?.activity?.running === true, String(running?.activity?.phase))
-  check('fixture: the busy flag ignores the idle heartbeat', runs.live.busy === true, `busy=${runs.live.busy}`)
+  check('fixture: a failed request does not stay open', runs.live.openRequests === 1 && running?.activity?.openRequests === 1, `open=${runs.live.openRequests}`)
   check('fixture: the finished run carries its own report', finished?.running === false && finished?.outcome === 'done' && finished?.counts?.changed === 2, JSON.stringify(finished?.counts ?? null))
   check('fixture: the finished run keeps its duration and tokens', finished?.durationMs === 30_000 && finished?.tokens === 222 && finished?.toolUses === 3, `${finished?.durationMs}ms ${finished?.tokens} tokens`)
   check('fixture: turns are counted from the transcript', (running?.turns ?? 0) === 2, String(running?.turns))
   check('fixture: counts summarise both runs', runs.counts.running === 1 && runs.counts.completed === 1, JSON.stringify(runs.counts))
-  check('fixture: the parent session rollup lists children', runs.tasks.length === 0 && runs.sessions.some((entry) => entry.sessionId === 'sess_parent-1'), `${runs.sessions.length} sessions`)
+  check('fixture: the parent session is rolled up', runs.tasks.length === 0 && runs.sessions.some((entry) => entry.sessionId === 'sess_parent-1'), `${runs.sessions.length} sessions`)
+  check('fixture: the main agent is the session that owns the runs', runs.live.main?.sessionId === 'sess_parent-1', JSON.stringify(runs.live.main?.sessionId ?? null))
+  check('fixture: the main agent counts its subagents', runs.live.main?.agents === 2 && runs.live.main?.runningAgents === 1, `agents=${runs.live.main?.agents} running=${runs.live.main?.runningAgents}`)
+  check('fixture: the main agent is idle while its subagent generates', runs.live.main?.generating === false && runs.live.main?.toolCalls === 1, `generating=${runs.live.main?.generating} toolCalls=${runs.live.main?.toolCalls}`)
+  check('fixture: a heartbeat-only log is not busy', (await runsModule.describeRuns(quiet)).live.busy === false, 'busy with only memory samples')
+  check('fixture: re-pricing refreshes the time-derived view', await (async () => {
+    // The parse is cached by file size, which does not change while the client sits idle. Advance
+    // the clock instead of the file: the re-priced view must grow with it, or the panel would
+    // report a frozen "generating · Ns" forever (the client dying with a request open).
+    const parsed0 = runsModule.readActivityFromLog(fixture)
+    const later = runsModule.repriceActivity(parsed0, Date.now() + 90_000)
+    const waitingOf = (activity) => activity.sessions.find((entry) => entry.sessionId.includes('subagent'))?.waitingMs ?? 0
+    const grew = waitingOf(later) - waitingOf(parsed0)
+    return later.busy === true && Math.abs(grew - 90_000) < 2000
+  })(), 'time-derived view follows the clock')
   check('fixture: a missing task index degrades quietly', runs.indexAvailable === false && Array.isArray(runs.notes), String(runs.indexAvailable))
   check('fixture: no prompt text leaks into the snapshot', !JSON.stringify(runs).includes('PROMPT-MUST-NOT-APPEAR') && !('prompt' in (running ?? {})))
 
   rmSync(fixture, { recursive: true, force: true })
+  rmSync(quiet, { recursive: true, force: true })
 }
 
 const failed = results.filter((entry) => !entry.ok)
